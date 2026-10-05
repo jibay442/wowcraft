@@ -1,0 +1,17 @@
+[package]
+name = "wowcraft-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "WowCraft: play, host and join from one window"
+license = "MIT"
+
+[dependencies]
+eframe = "0.33"
+rfd = "0.15"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = "s"
+strip = true
