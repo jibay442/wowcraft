@@ -4,7 +4,8 @@
 //! (`mariadb/data`), the server's maps (`server/data`), and Prism with its sign-in and worlds.
 //!
 //! On Linux the launcher is an AppImage: the release's `WowCraft-x86_64.AppImage` (its own asset,
-//! or inside the zip) replaces the one running.
+//! or inside the zip) replaces the one running. A release with only the AppImage updates just the
+//! launcher.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,8 +29,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct Release {
     pub version: String,
-    url: String,
-    size: u64,
+    /// The game's zip (link and size), when the release has it.
+    zip: Option<(String, u64)>,
     /// The Linux launcher, when the release has it as an asset of its own (link and size).
     appimage: Option<(String, u64)>,
 }
@@ -54,9 +55,12 @@ pub fn check() -> Option<Release> {
     if !newer(&version, VERSION) {
         return None;
     }
-    let (url, size) = asset(&json, "WowCraft.zip")?;
+    let zip = asset(&json, "WowCraft.zip");
     let appimage = if cfg!(windows) { None } else { asset(&json, APPIMAGE) };
-    Some(Release { version, url, size, appimage })
+    if zip.is_none() && appimage.is_none() {
+        return None;
+    }
+    Some(Release { version, zip, appimage })
 }
 
 /// A release asset's download link and size: its size follows its name, its link comes later.
@@ -105,20 +109,24 @@ pub fn download(root: &Path, release: &Release, progress: &dyn Fn(f32)) -> Resul
     let dir = root.join("update");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
-    let zip = dir.join("WowCraft.zip");
-    let total = release.size + release.appimage.as_ref().map_or(0, |a| a.1);
-    fetch(&release.url, release.size, &zip, &|got| progress((got as f32 / total.max(1) as f32).min(1.0)))?;
+    let zip_size = release.zip.as_ref().map_or(0, |z| z.1);
+    let total = zip_size + release.appimage.as_ref().map_or(0, |a| a.1);
     let unpacked = dir.join("x");
-    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
-    let ok = unzip(&zip, &unpacked);
     let new = unpacked.join("WowCraft");
-    if !ok || !new.join("wow").is_dir() {
-        return Err("The update couldn't be unpacked.".into());
+    if let Some((url, size)) = &release.zip {
+        let zip = dir.join("WowCraft.zip");
+        fetch(url, *size, &zip, &|got| progress((got as f32 / total.max(1) as f32).min(1.0)))?;
+        std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
+        if !unzip(&zip, &unpacked) || !new.join("wow").is_dir() {
+            return Err("The update couldn't be unpacked.".into());
+        }
+    } else {
+        std::fs::create_dir_all(&new).map_err(|e| e.to_string())?;
     }
     // The Linux launcher, beside the rest as if it had come in the zip.
     if let Some((url, size)) = &release.appimage {
         let to = new.join(APPIMAGE);
-        fetch(url, *size, &to, &|got| progress(((release.size + got) as f32 / total.max(1) as f32).min(1.0)))?;
+        fetch(url, *size, &to, &|got| progress(((zip_size + got) as f32 / total.max(1) as f32).min(1.0)))?;
     }
     Ok(new)
 }
@@ -149,6 +157,15 @@ fn fetch(url: &str, size: u64, to: &Path, progress: &dyn Fn(u64)) -> Result<(), 
 /// Copies the new programs from `new` over the install at `root` (with nothing running); then
 /// [`restart`].
 pub fn apply(root: &Path, new: &Path) -> Result<(), String> {
+    // A release with only the launcher: the game stays as it is.
+    if new.join("wow").is_dir() {
+        apply_game(root, new)?;
+    }
+    replace_launcher(root, new)
+}
+
+/// The game's programs from the unpacked zip at `new`.
+fn apply_game(root: &Path, new: &Path) -> Result<(), String> {
     let copy = |rel: &str| copy_tree(&new.join(rel), &root.join(rel)).map_err(|e| format!("couldn't update {rel}: {e}"));
     // The bundled mods are ours alone: older jars go, so a renamed one isn't loaded twice.
     let mods = root.join("minecraft").join("WowCraft").join("minecraft").join("mods");
@@ -169,11 +186,16 @@ pub fn apply(root: &Path, new: &Path) -> Result<(), String> {
         }
     }
     let _ = std::fs::copy(new.join("README.txt"), root.join("README.txt"));
+    Ok(())
+}
+
+/// The launcher from `new`, if it has one.
+fn replace_launcher(root: &Path, new: &Path) -> Result<(), String> {
     // Programs keep running from a file that's renamed, not one overwritten: the old launcher
     // steps aside.
     let (exe, old, fresh) = launcher_files(root, new);
     if !fresh.is_file() {
-        // A release without a Linux launcher: the game is updated, this launcher stays.
+        // A release without a launcher for this system: this one stays.
         return Ok(());
     }
     let _ = std::fs::remove_file(&old);
@@ -284,7 +306,7 @@ mod tests {
         std::fs::write(root.join("wow/benilla.exe"), "old").unwrap();
         let size = std::fs::metadata(&zip).unwrap().len();
         let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
-        let release = Release { version: "9.9.9".into(), url, size, appimage: None };
+        let release = Release { version: "9.9.9".into(), zip: Some((url, size)), appimage: None };
         let new = download(&root, &release, &|_| {}).unwrap();
         apply(&root, &new).unwrap();
         for (f, want) in [("mariadb/data/characters.marker", "mine"), ("server/data/maps.marker", "mine"), ("prism/accounts.json", "mine")] {

@@ -54,8 +54,8 @@ WoW through Windows shared memory). Sign in to Prism there the first time.
 | MariaDB | Optional: a system `mariadbd` is used before the bundled Windows one |
 | Linux | x86_64, glibc 2.30 or newer (any current distribution) |
 
-1. Download `WowCraft.zip` and `WowCraft-x86_64.AppImage` from [Releases](../../releases/latest).
-   The zip is the same one Windows uses: the game, the server and Prism are in it.
+1. Download `WowCraft-x86_64.AppImage` from [Releases](../../releases/latest). You also need
+   `WowCraft.zip`, the same package Windows uses: the game, the server and Prism are in it.
 2. Unzip `WowCraft.zip` anywhere in your home folder.
 3. Make `WowCraft-x86_64.AppImage` executable (`chmod +x`) and run it. Kept in the `WowCraft`
    folder, it finds it by itself; kept elsewhere, pick the folder in Settings → WowCraft folder.
@@ -194,11 +194,10 @@ linux/build-appimage.sh --native   # with this machine's Rust
 3. GitHub Actions ([`.github/workflows/linux-appimage.yml`](.github/workflows/linux-appimage.yml))
    builds `WowCraft-x86_64.AppImage` and attaches it to the `v0.1.2` release, creating the
    release if there isn't one yet.
-4. Upload `WowCraft.zip` (the Windows build of the whole package) to the same release.
 
-Both files must be on the release: Windows players need the zip; Linux players need the zip and
-the AppImage. The workflow can also be started by hand (Actions → Linux AppImage → Run
-workflow) to build an AppImage without releasing it.
+A release with only the AppImage updates just the Linux launcher; one that also has
+`WowCraft.zip` updates the game as well. The workflow can also be started by hand (Actions →
+Linux AppImage → Run workflow) to build an AppImage without releasing it.
 
 ## License
 
