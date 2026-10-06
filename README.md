@@ -30,7 +30,7 @@ Minecraft inside World of Warcraft 1.12. Runs on your PC with its own WoW server
 |---|---|
 | WoW client | 1.12.1 client folder (with `WoW.exe` and `Data`) |
 | Minecraft | Java Edition, your own Microsoft account |
-| OS | Windows 10 or 11, 64-bit |
+| OS | Windows 10 or 11, 64-bit, or Linux x86_64 (see [Linux](#linux)) |
 | Disk | ~4 GB free |
 
 ## Install
@@ -40,6 +40,32 @@ Minecraft inside World of Warcraft 1.12. Runs on your PC with its own WoW server
 3. Run `WowCraft.exe`.
 4. Settings → Browse → pick your WoW 1.12 folder.
 5. Press **PLAY**.
+
+## Linux
+
+The Linux launcher is an AppImage. It runs the same WowCraft folder: Linux builds of its programs
+where the folder has them, the Windows ones through Wine otherwise. Minecraft runs through the
+bundled Prism Launcher under Wine too, in the same Wine prefix as WoW (the WowCraft mod talks to
+WoW through Windows shared memory). Sign in to Prism there the first time.
+
+| | |
+|---|---|
+| Wine | Your distribution's `wine` package (WoW, Minecraft and the server run through it) |
+| MariaDB | Optional: a system `mariadbd` is used before the bundled Windows one |
+| Linux | x86_64, glibc 2.30 or newer (any current distribution) |
+
+1. Download `WowCraft.zip` and `WowCraft-x86_64.AppImage` from [Releases](../../releases/latest).
+   The zip is the same one Windows uses: the game, the server and Prism are in it.
+2. Unzip `WowCraft.zip` anywhere in your home folder.
+3. Make `WowCraft-x86_64.AppImage` executable (`chmod +x`) and run it. Kept in the `WowCraft`
+   folder, it finds it by itself; kept elsewhere, pick the folder in Settings → WowCraft folder.
+4. Settings → Browse → pick your WoW 1.12 folder, and press **PLAY**.
+
+On the first PLAY, Prism opens under Wine: sign in with your Microsoft account there (it's a
+separate Prism from any you have installed). It then downloads Minecraft and Java (once).
+
+WowCraft's Windows programs run in a Wine prefix of their own (`~/.local/share/WowCraft/wine`,
+or `$WINEPREFIX` if set); `$WINE` picks a Wine other than the one on your `PATH`.
 
 ## First start
 
@@ -107,7 +133,8 @@ Saves live in the WowCraft folder (`mariadb\data` and Prism's `WowCraft` instanc
 The launcher checks for new versions on start. When one is out, press **Update**. Saves and
 settings are kept.
 
-Manually: unzip a newer `WowCraft.zip` over your WowCraft folder. Same result.
+Manually: unzip a newer `WowCraft.zip` over your WowCraft folder. Same result. On Linux, also
+replace your `WowCraft-x86_64.AppImage` with the release's.
 
 ## Troubleshooting
 
@@ -118,8 +145,11 @@ Manually: unzip a newer `WowCraft.zip` over your WowCraft folder. Same result.
 | Minecraft doesn't start | Sign in to Prism (Accounts, top right), press PLAY again. |
 | Stuck on "Please wait" | Minecraft is still loading. When joining: check the link. |
 | Port in use | Close any other WoW server or database. |
+| Linux: "Wine is needed" | Install your distribution's `wine` package. |
+| Linux: first setup failed | Check `server/data/*.log` (they include Wine's errors), press PLAY again. |
 
-Logs: `wow\run_err.txt` (WoW), `server\logs` (server), Prism's instance log (Minecraft).
+Logs: `wow\run_err.txt` (WoW), `server\logs` (server), Prism's instance log (Minecraft:
+`prism/instances/WowCraft/minecraft/logs/latest.log`).
 
 ## Known issues
 
@@ -147,6 +177,28 @@ No Blizzard or Mojang files are included.
 cd launcher
 cargo build --release
 ```
+
+The Linux AppImage (in `launcher/target/appimage/`):
+
+```
+cd launcher
+linux/build-appimage.sh            # in a Debian 11 container (Docker or Podman): runs on glibc 2.30+
+linux/build-appimage.sh --native   # with this machine's Rust
+```
+
+## Making a release
+
+1. Bump `version` in `launcher/Cargo.toml` (the launcher compares it with the release tag to
+   offer updates).
+2. Commit, then tag and push: `git tag v0.1.2 && git push origin main v0.1.2`.
+3. GitHub Actions ([`.github/workflows/linux-appimage.yml`](.github/workflows/linux-appimage.yml))
+   builds `WowCraft-x86_64.AppImage` and attaches it to the `v0.1.2` release, creating the
+   release if there isn't one yet.
+4. Upload `WowCraft.zip` (the Windows build of the whole package) to the same release.
+
+Both files must be on the release: Windows players need the zip; Linux players need the zip and
+the AppImage. The workflow can also be started by hand (Actions → Linux AppImage → Run
+workflow) to build an AppImage without releasing it.
 
 ## License
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WowCraft
+Comment=Minecraft in World of Warcraft: play, host and join from one window
+Exec=wowcraft-launcher
+Icon=wowcraft
+Terminal=false
+Categories=Game;

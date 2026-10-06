@@ -1,10 +1,12 @@
 """Draws the launcher's icon (a pixel-art grass block in a gold frame) without any image library:
-icon.rgba (64x64 raw RGBA, the window icon) and icon.ico (16..256 px, the exe icon).
+icon.rgba (64x64 raw RGBA, the window icon), icon.ico (16..256 px, the exe icon) and icon.png
+(256 px, the Linux AppImage's icon).
     python assets/make_icon.py
 """
 import os
 import random
 import struct
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 random.seed(7)
@@ -60,4 +62,19 @@ for s, data in zip(sizes, images):
     offset += len(data)
 with open(os.path.join(HERE, "icon.ico"), "wb") as f:
     f.write(out + b"".join(images))
-print("icon.rgba, icon.ico written")
+
+
+def png(img):
+    """A PNG: RGBA rows, each behind a 0 (no filter) byte, deflated."""
+    n = len(img)
+    raw = b"".join(b"\0" + b"".join(bytes(c) for c in row) for row in img)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+with open(os.path.join(HERE, "icon.png"), "wb") as f:
+    f.write(png(scaled(px, 256)))
+print("icon.rgba, icon.ico, icon.png written")

@@ -1,0 +1,37 @@
+# Builds the Linux launcher (WowCraft-x86_64.AppImage) and attaches it to the GitHub release.
+#
+# Pushing a tag such as v0.1.2 builds it and adds it to that tag's release (made if there isn't
+# one yet). Started by hand (Actions → Linux AppImage → Run workflow), it only builds, and the
+# AppImage is kept as the run's artifact.
+name: Linux AppImage
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # In a Debian 11 container (see the script), so the AppImage runs on glibc 2.30 and newer.
+      - name: Build
+        env:
+          WOWCRAFT_UPDATE_REPO: ${{ github.repository }}
+        run: launcher/linux/build-appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WowCraft-x86_64.AppImage
+          path: launcher/target/appimage/WowCraft-x86_64.AppImage
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: launcher/target/appimage/WowCraft-x86_64.AppImage

@@ -1,0 +1,4 @@
+#!/bin/sh
+# The AppImage's entry point: the launcher, which finds the WowCraft folder from $APPIMAGE.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/wowcraft-launcher" "$@"

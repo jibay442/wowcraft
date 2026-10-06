@@ -13,14 +13,19 @@
 //!   that Prism on each start and launched with `--launch`; settings reach the mod through
 //!   `config/skycraft.properties`, since Prism doesn't pass our environment on;
 //! - the development checkout (the Benilla checkout, `server/Release`, the Fabric dev client).
+//!
+//! On Linux the launcher is an AppImage put in the unzipped WowCraft folder. It runs the install's
+//! Linux programs where it has them and its Windows ones through Wine ([`platform`]); Minecraft
+//! runs through the bundled (Windows) Prism Launcher under Wine too, in the same Wine prefix: the
+//! mod and WoW share Windows shared memory, which only works between programs of one prefix.
 
 #![windows_subsystem = "windows"]
 
+mod platform;
 mod setup;
 mod update;
 
 use std::collections::HashMap;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -28,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use platform::Program;
 
 /// Where everything lives, detected once and kept in `wowcraft-launcher.cfg` beside the install.
 #[derive(Clone)]
@@ -48,27 +53,30 @@ const INSTANCE: &str = "WowCraft";
 
 impl Paths {
     fn detect() -> Self {
-        let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
-        let packaged_root = exe_dir.clone().filter(|d| d.join("wow").join("benilla.exe").exists());
+        // An AppImage runs from a mount of its own: its file's folder is the install.
+        let exe = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+        let exe_dir = exe.and_then(|e| e.parent().map(Path::to_path_buf));
+        let packaged_root = exe_dir.clone().filter(|d| benilla_in(d).exists());
+        // Else the folder chosen in Settings.
+        let known = read_cfg(&chosen_root_file()).remove("root").map(PathBuf::from).filter(|d| benilla_in(d).exists());
         let root = std::env::var_os("WOWCRAFT_ROOT")
             .map(PathBuf::from)
             .or_else(|| packaged_root.clone())
+            .or(known)
             .or_else(|| exe_dir.as_deref()?.ancestors().find(|p| p.join("benilla").is_dir() && p.join("server").is_dir()).map(Path::to_path_buf))
             // Neither: the folder the launcher is in (its problems list says what's missing).
             .or(exe_dir)
             .unwrap_or_default();
-        let packaged = root.join("wow").join("benilla.exe").exists();
+        let packaged = benilla_in(&root).exists();
+        // Nothing guessed: the WoW folder is the one chosen in Settings.
         let mut paths = Paths {
-            wow_data: PathBuf::from(r"C:\Program Files (x86)\World of Warcraft"),
+            wow_data: PathBuf::new(),
             skin: String::new(),
-            name: if packaged { String::new() } else { "Azerothian".into() },
+            name: String::new(),
             prism: None,
             packaged,
             root,
         };
-        if !packaged {
-            paths.wow_data = PathBuf::from(r"C:\Games\WoW Vanilla\Data");
-        }
         for (k, v) in read_cfg(&paths.cfg_file()) {
             match k.as_str() {
                 "wow_data" => paths.wow_data = PathBuf::from(v),
@@ -81,8 +89,11 @@ impl Paths {
         // A folder given for Prism (typed in Settings) means the program in it: Windows answers
         // "access denied" when asked to run a folder.
         paths.prism = paths.prism.map(prism_exe);
-        if paths.prism.as_ref().is_none_or(|p| !p.is_file()) {
-            paths.prism = find_prism().or_else(|| Some(paths.root.join("prism").join("prismlauncher.exe")).filter(|p| p.exists()));
+        if cfg!(not(windows)) {
+            // Linux: only the bundled Windows Prism will do (see the module's notes).
+            paths.prism = Some(bundled_prism(&paths.root)).filter(|p| p.exists());
+        } else if paths.prism.as_ref().is_none_or(|p| !p.is_file()) {
+            paths.prism = find_prism().or_else(|| Some(bundled_prism(&paths.root)).filter(|p| p.exists()));
         }
         paths
     }
@@ -98,13 +109,18 @@ impl Paths {
         data.parent().map(Path::to_path_buf).unwrap_or(data)
     }
 
+    /// The development checkout (else the launcher found no WowCraft folder at all).
+    fn dev(&self) -> bool {
+        !self.packaged && self.root.join("benilla").is_dir()
+    }
+
     fn cfg_file(&self) -> PathBuf {
         self.root.join("wowcraft-launcher.cfg")
     }
 
     fn save(&self) {
         // The bundled Prism isn't remembered: an install made later takes over.
-        let bundled = self.root.join("prism").join("prismlauncher.exe");
+        let bundled = bundled_prism(&self.root);
         let prism = self.prism.as_ref().filter(|p| **p != bundled).map(|p| p.display().to_string()).unwrap_or_default();
         let text = format!("wow_data={}\nskin={}\nname={}\nprism={}\n", self.wow_data.display(), self.skin, self.name, prism);
         let _ = std::fs::write(self.cfg_file(), text);
@@ -118,14 +134,16 @@ impl Paths {
         self.root.join("server").join("Release")
     }
     fn can_host(&self) -> bool {
-        if self.packaged { self.server().bin().join("mangosd.exe").exists() } else { self.dev_server().join("mangosd.exe").exists() }
+        if self.packaged { self.server().program("mangosd").exists() } else { platform::program(&self.dev_server(), "mangosd", &[]).exists() }
     }
     /// Where WoW runs (its settings and logs land here).
     fn benilla(&self) -> PathBuf {
         if self.packaged { self.root.join("wow") } else { self.root.join("benilla") }
     }
-    fn benilla_exe(&self) -> PathBuf {
-        if self.packaged { self.root.join("wow").join("benilla.exe") } else { self.root.join("benilla/target/release/benilla.exe") }
+    /// WoW: our Benilla client (a Linux build of it, or the Windows one through Wine).
+    fn benilla_exe(&self) -> Program {
+        let dir = if self.packaged { self.root.join("wow") } else { self.root.join("benilla/target/release") };
+        platform::program(&dir, "benilla", &[])
     }
     fn fabric(&self) -> PathBuf {
         self.root.join("wowcraft").join("fabric")
@@ -205,11 +223,24 @@ impl Paths {
         if let Some(problem) = self.wow_problem() {
             out.push(problem);
         }
-        if !self.benilla_exe().exists() {
-            out.push(if self.packaged { "wow\\benilla.exe is missing: unzip the whole folder".into() } else { "benilla.exe not built".into() });
+        let benilla = self.benilla_exe();
+        if !benilla.exists() {
+            out.push(if self.packaged {
+                format!("{} is missing: unzip the whole folder", Path::new("wow").join("benilla.exe").display())
+            } else if self.dev() {
+                "benilla not built".into()
+            } else {
+                "WowCraft's folder wasn't found: choose your unzipped WowCraft folder (with wow, server and minecraft in it) in Settings".into()
+            });
+        } else if benilla.wine && platform::wine().is_none() {
+            out.push("Wine is needed to run WowCraft's Windows programs: install it (your distribution's wine package)".into());
         }
         if self.packaged && self.prism.is_none() {
-            out.push("Prism Launcher not found: unzip the whole folder, or install it (prismlauncher.org)".into());
+            out.push(if cfg!(windows) {
+                "Prism Launcher not found: unzip the whole folder, or install it (prismlauncher.org)".into()
+            } else {
+                "prism/prismlauncher.exe is missing: unzip the whole folder".into()
+            });
         }
         out
     }
@@ -217,6 +248,9 @@ impl Paths {
     /// What's wrong with the chosen WoW folder, if anything: missing, or another version of WoW
     /// (its files don't fit the 1.12 server: it stopped at start with "wrong client version DBC").
     fn wow_problem(&self) -> Option<String> {
+        if self.wow_data.as_os_str().is_empty() {
+            return Some("Choose your WoW 1.12 folder (the one with WoW.exe and Data in it) in Settings".into());
+        }
         let data = self.data_dir();
         let shown = self.wow_data.display();
         // Today's WoW (Retail, Classic Era, Classic): CASC storage, no MPQ archives.
@@ -239,12 +273,38 @@ impl Paths {
     }
 }
 
-/// Prism Launcher in the places its installers put it.
+/// Where the WowCraft folder chosen in Settings is kept (for a launcher that isn't in it).
+fn chosen_root_file() -> PathBuf {
+    let config = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default()
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| platform::home().join(".config"))
+    };
+    config.join("WowCraft").join("launcher.cfg")
+}
+
+/// WoW's program in a packaged install's root, either build.
+fn benilla_in(root: &Path) -> PathBuf {
+    let native = root.join("wow").join("benilla");
+    if cfg!(not(windows)) && native.is_file() { native } else { root.join("wow").join("benilla.exe") }
+}
+
+/// The Prism Launcher bundled in the install's `prism` folder.
+fn bundled_prism(root: &Path) -> PathBuf {
+    root.join("prism").join("prismlauncher.exe")
+}
+
 /// Prism's program from what was chosen: a folder means the prismlauncher.exe in it.
 fn prism_exe(chosen: PathBuf) -> PathBuf {
     if chosen.is_dir() { chosen.join("prismlauncher.exe") } else { chosen }
 }
 
+/// How Prism runs: itself, or (Linux) through Wine, in WoW's prefix.
+fn prism_program(exe: &Path) -> Program {
+    Program { path: exe.to_path_buf(), wine: cfg!(not(windows)), bundled: true }
+}
+
+/// Prism Launcher in the places its installers put it.
 fn find_prism() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     [
@@ -266,15 +326,9 @@ fn read_cfg(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// Which processes are up, by image name, lowercased (refreshed every couple of seconds).
+/// Which processes are up, by name, lowercased and without `.exe` (refreshed every couple of seconds).
 fn running() -> Vec<String> {
-    let out = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
-        .unwrap_or_default();
-    out.lines().filter_map(|l| l.split(',').next().map(|s| s.trim_matches('"').to_string())).collect()
+    platform::running()
 }
 
 /// Sets `key=value` lines in a properties file, keeping the rest.
@@ -403,7 +457,7 @@ impl App {
                         gone_since = None;
                         continue;
                     }
-                    let wow = running().iter().any(|p| p == "benilla.exe");
+                    let wow = running().iter().any(|p| p == "benilla");
                     if wow || minecraft_running(&paths.game_dir()) {
                         seen = true;
                         gone_since = None;
@@ -477,7 +531,7 @@ impl App {
         self.server_up = if self.paths.packaged {
             setup::listening(setup::REALM_PORT) && setup::listening(setup::WORLD_PORT)
         } else {
-            self.up("mangosd.exe") && self.up("realmd.exe")
+            self.up("mangosd") && self.up("realmd")
         };
         self.polled = Instant::now();
     }
@@ -519,9 +573,9 @@ impl App {
     fn stop(&mut self, server_too: bool) {
         self.mode = None;
         self.poll();
-        let wow = self.up("benilla.exe");
+        let wow = self.up("benilla");
         let minecraft = self.minecraft_up();
-        let server = server_too && (self.server_up || self.up("mariadbd.exe"));
+        let server = server_too && (self.server_up || self.up("mariadbd"));
         let shared = self.shared.clone();
         if !wow && !minecraft && !server {
             let mut s = shared.lock().unwrap();
@@ -546,7 +600,7 @@ impl App {
 }
 
 fn stop_all(paths: &Paths, shared: &Arc<Mutex<Shared>>, server_too: bool) {
-    let _ = Command::new("taskkill").args(["/IM", "benilla.exe", "/F"]).creation_flags(CREATE_NO_WINDOW).status();
+    platform::kill("benilla", true);
     // Minecraft saves the world and quits when asked (wowcraft-quit.request; Prism's also by itself
     // once WoW has gone); the dev client is forced only if it hasn't within 20 seconds.
     let _ = std::fs::write(paths.game_dir().join("wowcraft-quit.request"), "");
@@ -556,10 +610,7 @@ fn stop_all(paths: &Paths, shared: &Arc<Mutex<Shared>>, server_too: bool) {
         while asked.elapsed() < Duration::from_secs(20) && mc.try_wait().ok().flatten().is_none() {
             std::thread::sleep(Duration::from_millis(250));
         }
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &mc.id().to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        platform::kill_tree(mc.id());
         let _ = mc.wait();
     } else if paths.packaged {
         // Give Prism's Minecraft its time to save before the server goes.
@@ -576,11 +627,11 @@ fn stop_all(paths: &Paths, shared: &Arc<Mutex<Shared>>, server_too: bool) {
             paths.server().stop();
         } else {
             // The world server first: it saves characters on the way out.
-            let _ = Command::new("taskkill").args(["/IM", "mangosd.exe"]).creation_flags(CREATE_NO_WINDOW).status();
+            platform::kill("mangosd", false);
             std::thread::sleep(Duration::from_secs(3));
-            let _ = Command::new("taskkill").args(["/IM", "realmd.exe", "/F"]).creation_flags(CREATE_NO_WINDOW).status();
-            let admin = paths.root.join("mariadb/bin/mariadb-admin.exe");
-            let _ = Command::new(admin).args(["-u", "root", "shutdown"]).creation_flags(CREATE_NO_WINDOW).status();
+            platform::kill("realmd", true);
+            let admin = platform::program(&paths.root.join("mariadb/bin"), "mariadb-admin", &["mariadb-admin", "mysqladmin"]);
+            let _ = admin.command().args(["-u", "root", "shutdown"]).status();
         }
     }
 }
@@ -593,29 +644,30 @@ fn step(shared: &Arc<Mutex<Shared>>, text: &str) {
 fn start_dev_server(p: &Paths, shared: &Arc<Mutex<Shared>>) -> Result<(), String> {
     let procs = running();
     let up = |image: &str| procs.iter().any(|x| x == image);
-    if !up("mariadbd.exe") {
+    if !up("mariadbd") {
         step(shared, "Starting the database...");
         let maria = p.root.join("mariadb");
-        Command::new(maria.join("bin/mariadbd.exe"))
-            .arg(format!("--defaults-file={}", maria.join("data/my.ini").display()))
-            .creation_flags(CREATE_NO_WINDOW)
+        let server = platform::program(&maria.join("bin"), "mariadbd", &["mariadbd", "mysqld"]);
+        server
+            .command()
+            .arg(format!("--defaults-file={}", server.path_arg(&maria.join("data/my.ini"))))
             .spawn()
             .map_err(|e| format!("couldn't start the database: {e}"))?;
         std::thread::sleep(Duration::from_secs(5));
     }
-    if !up("realmd.exe") {
+    if !up("realmd") {
         step(shared, "Starting the login server...");
-        Command::new(p.dev_server().join("realmd.exe"))
+        platform::program(&p.dev_server(), "realmd", &[])
+            .command()
             .current_dir(p.dev_server())
-            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("couldn't start the login server: {e}"))?;
     }
-    if !up("mangosd.exe") {
+    if !up("mangosd") {
         step(shared, "Starting the world server (takes a few seconds)...");
-        Command::new(p.dev_server().join("mangosd.exe"))
+        platform::program(&p.dev_server(), "mangosd", &[])
+            .command()
             .current_dir(p.dev_server())
-            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("couldn't start the world server: {e}"))?;
         std::thread::sleep(Duration::from_secs(15));
@@ -628,8 +680,8 @@ fn start_dev_server(p: &Paths, shared: &Arc<Mutex<Shared>>) -> Result<(), String
 /// own copy of the instance.
 fn start_prism(p: &Paths) -> Result<(), String> {
     let prism = p.prism.as_ref().ok_or("Prism Launcher not found")?;
-    let start = |exe: &Path| Command::new(exe).args(["--launch", INSTANCE]).spawn();
-    let bundled = p.root.join("prism").join("prismlauncher.exe");
+    let start = |exe: &Path| prism_program(exe).command().args(["--launch", INSTANCE]).spawn();
+    let bundled = bundled_prism(&p.root);
     let started = start(prism).or_else(|e| {
         // Another Prism that won't start: the bundled one instead.
         if bundled.is_file() && bundled != *prism {
@@ -643,13 +695,15 @@ fn start_prism(p: &Paths) -> Result<(), String> {
         }
     });
     if let Err(e) = started {
-        return Err(if e.raw_os_error() == Some(5) {
+        return Err(if cfg!(windows) && e.raw_os_error() == Some(5) {
             format!(
                 "Windows refused to start Prism Launcher ({}). Your antivirus may be blocking it: allow that file, or right-click it, Properties, Unblock. Then press PLAY again.",
                 prism.display()
             )
+        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Prism Launcher ({}) isn't allowed to run: make it executable (chmod +x), then press PLAY again.", prism.display())
         } else {
-            format!("couldn't start Prism Launcher: {e}")
+            format!("couldn't start Prism Launcher ({}): {e}", prism.display())
         });
     }
     Ok(())
@@ -666,7 +720,7 @@ fn minecraft_settings(p: &Paths, mode: Mode, link: &str) {
         keys.extend([
             ("lan_port", if host { "25566".to_string() } else { String::new() }),
             ("host_account", "1".into()),
-            ("mariadb", p.server().mariadb_client().display().to_string()),
+            ("mariadb", minecraft_mariadb(p)),
             ("mariadb_port", setup::DB_PORT.to_string()),
         ]);
     }
@@ -677,34 +731,25 @@ fn minecraft_settings(p: &Paths, mode: Mode, link: &str) {
     let _ = std::fs::remove_file(p.game_dir().join("wowcraft-quit.request"));
 }
 
-/// Whether our Minecraft is running: it holds its log open, and Windows then lets nobody else open
-/// it alone. Any Java counted before, so a build tool or another Java game kept "Minecraft" up: the
-/// server wasn't stopped when the game closed, and closing the launcher waited out its 20 seconds.
-fn minecraft_running(game_dir: &Path) -> bool {
-    use std::os::windows::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new().read(true).share_mode(0).open(game_dir.join("logs").join("latest.log")) {
-        Ok(_) => false,
-        // ERROR_SHARING_VIOLATION: someone (Minecraft) has it open.
-        Err(e) => e.raw_os_error() == Some(32),
+/// The database client as Minecraft's mod runs it: on Linux the mod runs under Wine, so the
+/// bundled Windows client, by its Windows path.
+fn minecraft_mariadb(p: &Paths) -> String {
+    if cfg!(windows) {
+        return p.server().mariadb_client().display().to_string();
     }
+    platform::windows_path(&p.root.join("mariadb").join("bin").join("mariadb.exe"))
+}
+
+/// Whether our Minecraft is running: it holds its log open. Any Java counted before, so a build
+/// tool or another Java game kept "Minecraft" up: the server wasn't stopped when the game closed,
+/// and closing the launcher waited out its 20 seconds.
+fn minecraft_running(game_dir: &Path) -> bool {
+    platform::held_open(&game_dir.join("logs").join("latest.log"))
 }
 
 /// The process ids of the Javas running now (Minecraft is one).
 fn java_pids() -> Vec<u32> {
-    let out = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
-        .unwrap_or_default();
-    out.lines()
-        .filter_map(|l| {
-            let mut cols = l.split(',').map(|c| c.trim_matches('"'));
-            let image = cols.next()?;
-            let pid = cols.next()?.parse().ok()?;
-            (image == "javaw.exe" || image == "java.exe").then_some(pid)
-        })
-        .collect()
+    platform::processes().into_iter().filter(|(_, image)| image == "javaw" || image == "java").map(|(pid, _)| pid).collect()
 }
 
 /// Starts what `mode` needs, in order. Runs on its own thread.
@@ -715,7 +760,7 @@ fn launch(p: &Paths, mode: Mode, link: &str, shared: &Arc<Mutex<Shared>>) -> Res
     if mode != Mode::Join && !p.can_host() {
         return Err("This copy has no WoW server: it can only join friends.".into());
     }
-    if running().iter().any(|x| x == "benilla.exe") {
+    if running().iter().any(|x| x == "benilla") {
         return Err("WoW is already running. Press Stop first.".into());
     }
     let say = |text: &str| step(shared, text);
@@ -757,15 +802,18 @@ fn launch(p: &Paths, mode: Mode, link: &str, shared: &Arc<Mutex<Shared>>) -> Res
 
     say("Starting WoW...");
     let log = |name: &str| std::fs::File::create(p.benilla().join(name)).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
-    let mut wow = Command::new(p.benilla_exe());
+    let benilla = p.benilla_exe();
+    // Paths as WoW takes them (Windows ones under Wine).
+    let path = |f: &Path| benilla.path_arg(f);
+    let mut wow = benilla.command();
     wow.current_dir(p.benilla())
-        .env("WOW_DATA", p.data_dir())
+        .env("WOW_DATA", path(&p.data_dir()))
         .env("WOWCRAFT", "1")
         .env("WOW_NOVSYNC", "1")
         // Our Minecraft skin (saved by the mod), for the character screens' Minecraft body.
-        .env("WOWCRAFT_SKIN_FILE", p.game_dir().join("wowcraft-skin.png"))
+        .env("WOWCRAFT_SKIN_FILE", path(&p.game_dir().join("wowcraft-skin.png")))
         // And our Minecraft name, which character creation offers.
-        .env("WOWCRAFT_NAME_FILE", p.game_dir().join("wowcraft-name.txt"))
+        .env("WOWCRAFT_NAME_FILE", path(&p.game_dir().join("wowcraft-name.txt")))
         .stdout(log("run_out.txt"))
         .stderr(log("run_err.txt"));
     // A guest's account comes from the friend's server; the packaged install's own from its
@@ -773,7 +821,7 @@ fn launch(p: &Paths, mode: Mode, link: &str, shared: &Arc<Mutex<Shared>>) -> Res
     if mode == Mode::Join || p.packaged {
         let _ = std::fs::remove_file(p.account_file());
         wow.env("WOW_HOST", "127.0.0.1")
-            .env("WOWCRAFT_ACCOUNT_FILE", p.account_file())
+            .env("WOWCRAFT_ACCOUNT_FILE", path(&p.account_file()))
             .env("WOW_ALLOW_ACCOUNT", "1")
             .env_remove("WOW_USER")
             .env_remove("WOW_PASS");
@@ -784,13 +832,21 @@ fn launch(p: &Paths, mode: Mode, link: &str, shared: &Arc<Mutex<Shared>>) -> Res
     if !p.packaged {
         say("Starting Minecraft...");
         minecraft_settings(p, mode, link);
-        let mut mc = Command::new("cmd");
-        mc.args(["/c", &format!("gradlew.bat runClient --no-daemon > {} 2>&1", p.root.join("wowcraft/runclient.log").display())])
-            .current_dir(p.fabric())
-            .env("JAVA_HOME", p.root.join("jdk25"))
-            .env("SKYCRAFT_USERNAME", &p.name)
-            .env("WOWCRAFT_MARIADB", p.root.join("mariadb/bin/mariadb.exe"))
-            .creation_flags(CREATE_NO_WINDOW);
+        let log = p.root.join("wowcraft/runclient.log").display().to_string();
+        let mut mc = if cfg!(windows) {
+            let mut mc = platform::command("cmd");
+            mc.args(["/c", &format!("gradlew.bat runClient --no-daemon > {log} 2>&1")]);
+            mc
+        } else {
+            let mut mc = Command::new("sh");
+            mc.args(["-c", &format!("./gradlew runClient --no-daemon > '{log}' 2>&1")]);
+            mc
+        };
+        mc.current_dir(p.fabric()).env("SKYCRAFT_USERNAME", &p.name).env("WOWCRAFT_MARIADB", p.server().mariadb_client());
+        // The checkout's own Java, if it has one.
+        if p.root.join("jdk25").is_dir() {
+            mc.env("JAVA_HOME", p.root.join("jdk25"));
+        }
         if !p.skin.is_empty() {
             mc.env("WOWCRAFT_SKIN", &p.skin);
         }
@@ -848,7 +904,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.paths.packaged {
             self.poll();
-            if self.up("benilla.exe") || self.minecraft_up() || self.server_up || self.up("mariadbd.exe") {
+            if self.up("benilla") || self.minecraft_up() || self.server_up || self.up("mariadbd") {
                 stop_all(&self.paths, &self.shared, true);
             } else {
                 self.paths.server().stop_mmaps();
@@ -867,7 +923,7 @@ impl eframe::App for App {
         };
         // A copy without a server only joins: just the join box.
         let friend = !self.paths.can_host();
-        let wow_up = self.up("benilla.exe");
+        let wow_up = self.up("benilla");
         let minecraft_up = self.minecraft_up();
         let server_up = self.server_up;
         let playing = wow_up || minecraft_up;
@@ -891,6 +947,8 @@ impl eframe::App for App {
             (false, true) => 430.0,
             _ => 400.0,
         };
+        // The WowCraft folder's own row in Settings.
+        let height = if self.show_settings && !self.paths.dev() { height + 90.0 } else { height };
         // The start screen's warning box (no WoW folder yet, say) sits above the buttons.
         let warned = !self.show_settings && self.mode.is_none() && !busy && !self.paths.problems().is_empty();
         let height = if warned { height + 30.0 + 22.0 * self.paths.problems().len() as f32 + 40.0 } else { height };
@@ -1104,10 +1162,43 @@ impl App {
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_width(w);
+            if !self.paths.dev() {
+                // The launcher needn't sit in the WowCraft folder (an AppImage kept elsewhere, say).
+                ui.label("WowCraft folder");
+                let mut root = self.paths.root.display().to_string();
+                let mut picked = false;
+                ui.horizontal(|ui| {
+                    picked |= field(ui, &mut root, "the unzipped WowCraft folder", w - browse_w - gap);
+                    if ui.add(egui::Button::new("Browse...").min_size(egui::vec2(browse_w, 34.0))).clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().set_title("Your WowCraft folder").pick_folder() {
+                            root = dir.display().to_string();
+                            picked = true;
+                        }
+                    }
+                });
+                let root = PathBuf::from(root.trim().trim_matches('"'));
+                if picked && benilla_in(&root).exists() {
+                    let file = chosen_root_file();
+                    if let Some(dir) = file.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&file, format!("root={}\n", root.display()));
+                    // Its own settings now; a WoW folder chosen before carries over if it has none.
+                    let wow_data = self.paths.wow_data.clone();
+                    self.paths = Paths::detect();
+                    if !read_cfg(&self.paths.cfg_file()).contains_key("wow_data") {
+                        self.paths.wow_data = wow_data;
+                        self.paths.save();
+                    }
+                } else if !self.paths.packaged {
+                    ui.label(RichText::new("Not found yet: pick the folder with wow, server and minecraft in it.").small().color(ERROR));
+                }
+                ui.add_space(6.0);
+            }
             ui.label("WoW 1.12 folder");
             let mut data = self.paths.wow_data.display().to_string();
             ui.horizontal(|ui| {
-                changed |= field(ui, &mut data, r"C:\Games\World of Warcraft", w - browse_w - gap);
+                changed |= field(ui, &mut data, "the folder with WoW.exe and Data", w - browse_w - gap);
                 if ui.add(egui::Button::new("Browse...").min_size(egui::vec2(browse_w, 34.0))).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().set_title("Your WoW 1.12 folder").pick_folder() {
                         data = dir.display().to_string();
@@ -1116,7 +1207,9 @@ impl App {
                 }
             });
             ui.add_space(6.0);
-            if self.paths.packaged {
+            if self.paths.packaged && cfg!(not(windows)) {
+                ui.label(RichText::new("Minecraft runs through the bundled Prism Launcher, under Wine with WoW.").small().color(MUTED));
+            } else if self.paths.packaged {
                 ui.label("Prism Launcher");
                 let mut prism = self.paths.prism.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 ui.horizontal(|ui| {
@@ -1133,9 +1226,9 @@ impl App {
                 if changed {
                     self.paths.prism = if prism.is_empty() { None } else { Some(PathBuf::from(prism)) };
                 }
-            } else {
+            } else if self.paths.dev() {
                 ui.label("Minecraft name");
-                changed |= field(ui, &mut self.paths.name, "Azerothian", w);
+                changed |= field(ui, &mut self.paths.name, "your name in Minecraft", w);
                 ui.add_space(6.0);
                 ui.label("Skin (a Minecraft account's name)");
                 changed |= field(ui, &mut self.paths.skin, "optional", w);
@@ -1170,8 +1263,8 @@ fn server_only() {
     let started = Instant::now();
     let result = (|| {
         if !server.has_maps() {
-            if !paths.data_dir().join("dbc.MPQ").exists() {
-                return Err(format!("WoW 1.12 not found in {}", paths.wow_data.display()));
+            if let Some(problem) = paths.wow_problem() {
+                return Err(problem);
             }
             server.extract(&paths.wow_dir(), &say, &|_| {})?;
             say(&format!("maps extracted in {} s", started.elapsed().as_secs()));
@@ -1292,10 +1385,12 @@ mod tests {
         assert!(check(&["Data/patch.MPQ", "Data/lichking.MPQ"]).unwrap().contains("later WoW"), "Wrath");
         assert!(check(&[".build.info", "Data/data/0000000001.idx"]).unwrap().contains("today's WoW"), "Classic/Retail");
         assert!(check(&["readme.txt"]).unwrap().contains("not found"), "wrong folder");
+        assert!(paths_at(&root, Path::new("")).wow_problem().unwrap().contains("Choose"), "none chosen yet");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A folder chosen for Prism means its program (Windows "access denied" for running a folder).
+    #[cfg(windows)]
     #[test]
     fn a_prism_folder_means_its_program() {
         let dir = tmp("prismdir");
@@ -1307,6 +1402,7 @@ mod tests {
     }
 
     /// A stand-in Prism: Windows' where.exe, which starts and quits at once.
+    #[cfg(windows)]
     fn fake_prism(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("portable.txt"), "").unwrap();
@@ -1316,17 +1412,20 @@ mod tests {
     }
 
     /// Windows refuses to run it: the same "Access is denied. (os error 5)" as the report.
+    #[cfg(windows)]
     fn deny_running(exe: &Path) {
         let ok = Command::new("icacls").arg(exe).args(["/deny", "*S-1-1-0:(RX)"]).stdout(Stdio::null()).status().unwrap().success();
         assert!(ok, "icacls deny");
     }
 
+    #[cfg(windows)]
     fn allow_running(exe: &Path) {
         let _ = Command::new("icacls").arg(exe).args(["/remove:d", "*S-1-1-0"]).stdout(Stdio::null()).status();
     }
 
     /// An installed Prism that Windows won't start: the bundled one starts instead, with the
     /// instance copied into it; with no bundled one, the message says what to do.
+    #[cfg(windows)]
     #[test]
     fn a_blocked_prism_falls_back_to_the_bundled_one() {
         let root = tmp("prismstart");

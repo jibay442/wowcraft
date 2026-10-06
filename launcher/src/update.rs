@@ -1,14 +1,19 @@
 //! Updates from the project's GitHub releases: the newest release's `WowCraft.zip`, downloaded and
-//! unpacked by Windows' own `curl.exe` and `tar.exe` (both in Windows 10 and 11), then copied over
-//! the install. Only the programs are replaced, never the player's data: the database
-//! (`mariadb\data`), the server's maps (`server\data`), and Prism with its sign-in and worlds.
+//! unpacked by `curl` and `tar` (both in Windows 10 and 11; on Linux `unzip` or `bsdtar`), then
+//! copied over the install. Only the programs are replaced, never the player's data: the database
+//! (`mariadb/data`), the server's maps (`server/data`), and Prism with its sign-in and worlds.
+//!
+//! On Linux the launcher is an AppImage: the release's `WowCraft-x86_64.AppImage` (its own asset,
+//! or inside the zip) replaces the one running.
 
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::CREATE_NO_WINDOW;
+use crate::platform;
+
+/// The Linux launcher's file in a release's zip.
+pub const APPIMAGE: &str = "WowCraft-x86_64.AppImage";
 
 /// The GitHub repository releases come from (`owner/name`), set when the package is built; empty
 /// in a build without it, which then never looks for updates.
@@ -25,6 +30,8 @@ pub struct Release {
     pub version: String,
     url: String,
     size: u64,
+    /// The Linux launcher, when the release has it as an asset of its own (link and size).
+    appimage: Option<(String, u64)>,
 }
 
 /// The newest release, if it's newer than this launcher (and GitHub answers: a private repository
@@ -33,11 +40,10 @@ pub fn check() -> Option<Release> {
     if REPO.is_empty() {
         return None;
     }
-    let out = Command::new("curl.exe")
+    let out = platform::command("curl")
         .args(["-sfL", "--max-time", "20", "-H", "User-Agent: WowCraft-launcher", "-H", "Accept: application/vnd.github+json"])
         .arg(format!("https://api.github.com/repos/{REPO}/releases/latest"))
         .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -48,11 +54,15 @@ pub fn check() -> Option<Release> {
     if !newer(&version, VERSION) {
         return None;
     }
-    // The asset named WowCraft.zip: its size follows its name, its download link comes later.
-    let at = json.find("\"name\":\"WowCraft.zip\"").or_else(|| json.find("\"name\": \"WowCraft.zip\""))?;
-    let size = number_after(&json, at, "size")?;
-    let url = string_after(&json, at, "browser_download_url")?;
-    Some(Release { version, url, size })
+    let (url, size) = asset(&json, "WowCraft.zip")?;
+    let appimage = if cfg!(windows) { None } else { asset(&json, APPIMAGE) };
+    Some(Release { version, url, size, appimage })
+}
+
+/// A release asset's download link and size: its size follows its name, its link comes later.
+fn asset(json: &str, name: &str) -> Option<(String, u64)> {
+    let at = json.find(&format!("\"name\":\"{name}\"")).or_else(|| json.find(&format!("\"name\": \"{name}\"")))?;
+    Some((string_after(json, at, "browser_download_url")?, number_after(json, at, "size")?))
 }
 
 /// Whether version `a` is newer than `b` (dotted numbers).
@@ -96,42 +106,44 @@ pub fn download(root: &Path, release: &Release, progress: &dyn Fn(f32)) -> Resul
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
     let zip = dir.join("WowCraft.zip");
-    let mut curl = Command::new("curl.exe")
+    let total = release.size + release.appimage.as_ref().map_or(0, |a| a.1);
+    fetch(&release.url, release.size, &zip, &|got| progress((got as f32 / total.max(1) as f32).min(1.0)))?;
+    let unpacked = dir.join("x");
+    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
+    let ok = unzip(&zip, &unpacked);
+    let new = unpacked.join("WowCraft");
+    if !ok || !new.join("wow").is_dir() {
+        return Err("The update couldn't be unpacked.".into());
+    }
+    // The Linux launcher, beside the rest as if it had come in the zip.
+    if let Some((url, size)) = &release.appimage {
+        let to = new.join(APPIMAGE);
+        fetch(url, *size, &to, &|got| progress(((release.size + got) as f32 / total.max(1) as f32).min(1.0)))?;
+    }
+    Ok(new)
+}
+
+/// Downloads `url` (`size` bytes) to `to`, telling `progress` the bytes so far.
+fn fetch(url: &str, size: u64, to: &Path, progress: &dyn Fn(u64)) -> Result<(), String> {
+    let mut curl = platform::command("curl")
         .args(["-sfL", "-H", "User-Agent: WowCraft-launcher", "-o"])
-        .arg(&zip)
-        .arg(&release.url)
+        .arg(to)
+        .arg(url)
         .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("couldn't start the download: {e}"))?;
     let status = loop {
         if let Some(status) = curl.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        let got = std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
-        progress((got as f32 / release.size.max(1) as f32).min(1.0));
+        progress(std::fs::metadata(to).map(|m| m.len()).unwrap_or(0));
         std::thread::sleep(Duration::from_millis(250));
     };
-    let got = std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
-    if !status.success() || got != release.size {
+    let got = std::fs::metadata(to).map(|m| m.len()).unwrap_or(0);
+    if !status.success() || got != size {
         return Err("The download failed. Check your connection and try again.".into());
     }
-    let unpacked = dir.join("x");
-    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
-    let ok = Command::new("tar.exe")
-        .arg("-xf")
-        .arg(&zip)
-        .arg("-C")
-        .arg(&unpacked)
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .is_ok_and(|s| s.success());
-    let new = unpacked.join("WowCraft");
-    if !ok || !new.join("WowCraft.exe").exists() {
-        return Err("The update couldn't be unpacked.".into());
-    }
-    Ok(new)
+    Ok(())
 }
 
 /// Copies the new programs from `new` over the install at `root` (with nothing running); then
@@ -145,7 +157,7 @@ pub fn apply(root: &Path, new: &Path) -> Result<(), String> {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    for rel in ["wow", "minecraft", "licenses", "mariadb\\data-clean"] {
+    for rel in ["wow", "minecraft", "licenses", "mariadb/data-clean"] {
         if new.join(rel).exists() {
             copy(rel)?;
         }
@@ -157,27 +169,63 @@ pub fn apply(root: &Path, new: &Path) -> Result<(), String> {
         }
     }
     let _ = std::fs::copy(new.join("README.txt"), root.join("README.txt"));
-    // A running program can be renamed, not overwritten: the old launcher steps aside.
-    let exe = root.join("WowCraft.exe");
-    let old = root.join("WowCraft.old.exe");
+    // Programs keep running from a file that's renamed, not one overwritten: the old launcher
+    // steps aside.
+    let (exe, old, fresh) = launcher_files(root, new);
+    if !fresh.is_file() {
+        // A release without a Linux launcher: the game is updated, this launcher stays.
+        return Ok(());
+    }
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&exe, &old).map_err(|e| format!("couldn't replace the launcher: {e}"))?;
-    if let Err(e) = std::fs::copy(new.join("WowCraft.exe"), &exe) {
+    if let Err(e) = std::fs::copy(&fresh, &exe) {
         let _ = std::fs::rename(&old, &exe);
         return Err(format!("couldn't replace the launcher: {e}"));
     }
+    platform::make_executable(&exe);
     Ok(())
+}
+
+/// The launcher's file, where it steps aside to, and its new copy in the unpacked release `new`:
+/// `WowCraft.exe` on Windows, the running AppImage on Linux.
+fn launcher_files(root: &Path, new: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    if cfg!(windows) {
+        return (root.join("WowCraft.exe"), root.join("WowCraft.old.exe"), new.join("WowCraft.exe"));
+    }
+    let exe = launcher(root);
+    let old = exe.with_extension("AppImage.old");
+    (exe, old, new.join(APPIMAGE))
+}
+
+/// The launcher's own file: `$APPIMAGE` (set by the AppImage runtime), else this program.
+fn launcher(root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return root.join("WowCraft.exe");
+    }
+    std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).unwrap_or_else(|| root.join(APPIMAGE))
+}
+
+/// Unpacks `zip` into `to`: `tar` on Windows (it reads zips there); `unzip`, else `bsdtar`, on Linux.
+fn unzip(zip: &Path, to: &Path) -> bool {
+    let run = |tool: &str, args: &[&std::ffi::OsStr]| platform::command(tool).args(args).stdin(Stdio::null()).status().is_ok_and(|s| s.success());
+    let (zip, to) = (zip.as_os_str(), to.as_os_str());
+    let tar = || run("tar", &["-xf".as_ref(), zip, "-C".as_ref(), to]);
+    if cfg!(windows) {
+        return tar();
+    }
+    run("unzip", &["-q".as_ref(), "-o".as_ref(), zip, "-d".as_ref(), to]) || run("bsdtar", &["-xf".as_ref(), zip, "-C".as_ref(), to])
 }
 
 /// Starts the (new) launcher; this one should exit right after.
 pub fn restart(root: &Path) -> Result<(), String> {
-    Command::new(root.join("WowCraft.exe")).current_dir(root).spawn().map_err(|e| format!("couldn't start the new launcher: {e}"))?;
+    Command::new(launcher(root)).current_dir(root).spawn().map_err(|e| format!("couldn't start the new launcher: {e}"))?;
     Ok(())
 }
 
 /// What an update leaves behind: the old launcher and the download.
 pub fn clean_up(root: &Path) {
-    let _ = std::fs::remove_file(root.join("WowCraft.old.exe"));
+    let (_, old, _) = launcher_files(root, root);
+    let _ = std::fs::remove_file(old);
     let _ = std::fs::remove_dir_all(root.join("update"));
 }
 
@@ -213,9 +261,8 @@ mod tests {
     fn the_release_json_gives_version_size_and_link() {
         let json = r#"{"tag_name":"v0.2.0","assets":[{"name":"Other.zip","size":5,"browser_download_url":"https://x/Other.zip"},{"name":"WowCraft.zip","uploader":{"login":"a"},"size":1234,"browser_download_url":"https://x/WowCraft.zip"}]}"#;
         assert_eq!(string_after(json, 0, "tag_name").as_deref(), Some("v0.2.0"));
-        let at = json.find("\"name\":\"WowCraft.zip\"").unwrap();
-        assert_eq!(number_after(json, at, "size"), Some(1234));
-        assert_eq!(string_after(json, at, "browser_download_url").as_deref(), Some("https://x/WowCraft.zip"));
+        assert_eq!(asset(json, "WowCraft.zip"), Some(("https://x/WowCraft.zip".into(), 1234)));
+        assert_eq!(asset(json, APPIMAGE), None);
     }
 
     /// The real package (WOWCRAFT_TEST_ZIP) downloads, unpacks and lands over an install whose
@@ -237,7 +284,7 @@ mod tests {
         std::fs::write(root.join("wow/benilla.exe"), "old").unwrap();
         let size = std::fs::metadata(&zip).unwrap().len();
         let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
-        let release = Release { version: "9.9.9".into(), url, size };
+        let release = Release { version: "9.9.9".into(), url, size, appimage: None };
         let new = download(&root, &release, &|_| {}).unwrap();
         apply(&root, &new).unwrap();
         for (f, want) in [("mariadb/data/characters.marker", "mine"), ("server/data/maps.marker", "mine"), ("prism/accounts.json", "mine")] {

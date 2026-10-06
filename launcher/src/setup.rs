@@ -6,14 +6,12 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::CREATE_NO_WINDOW;
+use crate::platform::{self, Program};
 
-const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
 /// The packaged database's port.
 pub const DB_PORT: u16 = 3307;
 pub const REALM_PORT: u16 = 3724;
@@ -32,25 +30,13 @@ pub fn listening(port: u16) -> bool {
     TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(150)).is_ok()
 }
 
-/// The program listening on a local TCP port (its executable's path), if any: `netstat` for the
-/// process id, then its path. Only asked when the port is taken, so the cost doesn't matter.
+/// The program listening on a local TCP port (its executable's path), if any. Only asked when the
+/// port is taken, so the cost doesn't matter.
 pub fn port_owner(port: u16) -> Option<String> {
     if !listening(port) {
         return None;
     }
-    let out = Command::new("netstat").args(["-ano", "-p", "TCP"]).creation_flags(CREATE_NO_WINDOW).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let pid = text.lines().find_map(|line| {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        (cols.len() >= 5 && cols[3] == "LISTENING" && cols[1].ends_with(&format!(":{port}"))).then(|| cols[4].to_string())
-    })?;
-    let path = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).Path")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    let path = String::from_utf8_lossy(&path.stdout).trim().to_string();
-    (!path.is_empty()).then_some(path)
+    platform::port_owner(port)
 }
 
 fn wait_for(port: u16, secs: u64) -> bool {
@@ -79,8 +65,26 @@ impl Server {
     fn maria(&self) -> PathBuf {
         self.root.join("mariadb")
     }
+    /// One of the server's programs (`mangosd`, `realmd`, the extractors).
+    pub fn program(&self, name: &str) -> Program {
+        platform::program(&self.bin(), name, &[])
+    }
+    /// The database's programs: the bundled ones, else (Linux) the system's MariaDB.
+    fn maria_program(&self, name: &str, system: &[&str]) -> Program {
+        platform::program(&self.maria().join("bin"), name, system)
+    }
+    fn mariadbd(&self) -> Program {
+        self.maria_program("mariadbd", &["mariadbd", "mysqld"])
+    }
+    fn mariadb_admin(&self) -> Program {
+        self.maria_program("mariadb-admin", &["mariadb-admin", "mysqladmin"])
+    }
+    pub fn mariadb(&self) -> Program {
+        self.maria_program("mariadb", &["mariadb", "mysql"])
+    }
+    /// The database client as Minecraft's mod starts it (a script for Wine's).
     pub fn mariadb_client(&self) -> PathBuf {
-        self.maria().join("bin").join("mariadb.exe")
+        self.mariadb().native(&self.maria().join("bin").join("mariadb-wine.sh"))
     }
 
     /// Maps and vmaps are there (mmaps are optional).
@@ -126,9 +130,12 @@ impl Server {
         let count = |dir: &str| std::fs::read_dir(data.join(dir)).map_or(0, |d| d.count());
         // Each tool's share of the bar (by how long it takes), its folder and how many files it writes.
         let run = |exe: &str, args: &[&str], stdin: Option<&str>, (from, to): (f32, f32), (dir, expected): (&str, usize)| -> Result<(), String> {
-            let log = std::fs::File::create(data.join(format!("{exe}.log"))).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
-            let mut cmd = Command::new(self.bin().join(format!("{exe}.exe")));
-            cmd.args(args).current_dir(&data).stdout(log).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW);
+            // Its output and its errors (Wine's too), in one log.
+            let log = std::fs::File::create(data.join(format!("{exe}.log"))).ok();
+            let err = log.as_ref().and_then(|f| f.try_clone().ok()).map_or_else(Stdio::null, Stdio::from);
+            let log = log.map_or_else(Stdio::null, Stdio::from);
+            let mut cmd = self.program(exe).command();
+            cmd.args(args).current_dir(&data).stdout(log).stderr(err);
             cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
             let mut child = cmd.spawn().map_err(|e| format!("couldn't start {exe}: {e}"))?;
             if let (Some(text), Some(mut input)) = (stdin, child.stdin.take()) {
@@ -143,17 +150,19 @@ impl Server {
                 std::thread::sleep(Duration::from_millis(500));
             };
             progress(to);
-            if status.success() { Ok(()) } else { Err(format!("{exe} failed (see server\\data\\{exe}.log)")) }
+            if status.success() { Ok(()) } else { Err(format!("{exe} failed (see {})", data_rel(&format!("{exe}.log")))) }
         };
-        let wow_s = wow.display().to_string();
-        let wow_data = wow.join("Data").display().to_string();
+        // The extractors are alike: the WoW folder as they take paths.
+        let extractor = self.program("MapExtractor");
+        let wow_s = extractor.path_arg(wow);
+        let wow_data = extractor.path_arg(&wow.join("Data"));
 
         step("Setting up the server: reading maps from your WoW (a few minutes, only the first time)...");
         // Its output path goes in a 128-character buffer: relative, since it runs in `data`.
         run("MapExtractor", &["-i", &wow_s, "-o", ".", "--silent"], None, (0.0, 0.3), ("maps", EXPECTED_MAPS))?;
         let maps = std::fs::read_dir(data.join("maps")).map_or(0, |d| d.flatten().count());
         if maps < 100 {
-            return Err("Reading maps from your WoW failed (see server\\data\\MapExtractor.log). Is the WoW folder a 1.12.1 client?".into());
+            return Err(format!("Reading maps from your WoW failed (see {}). Is the WoW folder a 1.12.1 client?", data_rel("MapExtractor.log")));
         }
         // The server reads its client tables from <build>/dbc.
         let dbc = data.join("5875").join("dbc");
@@ -180,40 +189,50 @@ impl Server {
     /// [`Self::stop_mmaps`] ends it (Stop, the game closing, the launcher closing); the next start
     /// resumes with the first map not yet done. They're used from the next server start.
     pub fn build_mmaps_in_background(&self, running: &[String]) {
-        if self.has_mmaps() || running.iter().any(|p| p == "movemapgenerator.exe") {
+        let generator = self.program("MoveMapGenerator");
+        if self.has_mmaps() || running.contains(&generator.image()) {
             return;
         }
         let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1));
         let data = self.data();
         let _ = std::fs::create_dir_all(data.join("mmaps"));
-        let generator = self.bin().join("MoveMapGenerator.exe");
-        let steps: Vec<String> = self
-            .map_ids()
-            .into_iter()
-            .filter(|&id| !self.map_done(id).exists())
-            .map(|id| {
-                format!(
-                    "\"{}\" {id} --silent --threads {threads} --skipJunkMaps --skipBattlegrounds --offMeshInput offmesh.txt --configInputPath config.json >> mmapgen.log 2>&1 && echo done> \"{}\"",
-                    generator.display(),
-                    self.map_done(id).display()
-                )
-            })
-            .collect();
-        if steps.is_empty() {
+        let todo: Vec<u32> = self.map_ids().into_iter().filter(|&id| !self.map_done(id).exists()).collect();
+        if todo.is_empty() {
             return;
         }
-        // A batch file, a map a line: all of them on one command line is past Windows' limit.
-        let script = data.join("mmaps").join("build.cmd");
-        if std::fs::write(&script, format!("@echo off\r\n{}\r\n", steps.join("\r\n"))).is_err() {
+        let args = |id: u32| {
+            format!("{id} --silent --threads {threads} --skipJunkMaps --skipBattlegrounds --offMeshInput offmesh.txt --configInputPath config.json >> mmapgen.log 2>&1")
+        };
+        // A script, a map a line: all of them on one command line is past Windows' limit.
+        let (script, text, mut cmd) = if cfg!(windows) {
+            let lines: Vec<String> = todo
+                .iter()
+                .map(|&id| format!("\"{}\" {} && echo done> \"{}\"", generator.path.display(), args(id), self.map_done(id).display()))
+                .collect();
+            let script = data.join("mmaps").join("build.cmd");
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/c").arg(&script);
+            (script, format!("@echo off\r\n{}\r\n", lines.join("\r\n")), cmd)
+        } else {
+            let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            // The generator as [`Program::command`] starts it (through Wine, with its settings).
+            let run = generator.command();
+            let env: Vec<String> = run.get_envs().filter_map(|(k, v)| Some(format!("{}={}", k.to_str()?, q(v?.to_str()?)))).collect();
+            let exe: Vec<String> = std::iter::once(run.get_program()).chain(run.get_args()).map(|a| q(&a.to_string_lossy())).collect();
+            let lines: Vec<String> = todo
+                .iter()
+                .map(|&id| format!("{} {} {} && echo done > {}", env.join(" "), exe.join(" "), args(id), q(&self.map_done(id).display().to_string())))
+                .collect();
+            let script = data.join("mmaps").join("build.sh");
+            let mut cmd = Command::new("nice");
+            cmd.args(["-n", "19", "sh"]).arg(&script);
+            (script, format!("#!/bin/sh\n{}\n", lines.join("\n")), cmd)
+        };
+        if std::fs::write(&script, text).is_err() {
             return;
         }
-        let child = Command::new("cmd")
-            .arg("/c")
-            .arg(&script)
-            .current_dir(&data)
-            .creation_flags(CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
-            .spawn();
-        if let Ok(child) = child {
+        platform::background(&mut cmd);
+        if let Ok(child) = cmd.current_dir(&data).stdin(Stdio::null()).spawn() {
             let _ = std::fs::write(data.join(MMAPS_PID), child.id().to_string());
         }
     }
@@ -222,21 +241,17 @@ impl Server {
     pub fn stop_mmaps(&self) {
         let pid_file = self.data().join(MMAPS_PID);
         if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok()) {
-            let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
+            platform::kill_tree(pid);
         }
         let _ = std::fs::remove_file(pid_file);
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "MoveMapGenerator.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        platform::kill(&self.program("MoveMapGenerator").image(), true);
     }
 
     /// Points the server's configs at this folder and the packaged database.
     pub fn write_configs(&self) -> Result<(), String> {
-        let slash = |p: PathBuf| p.display().to_string().replace('\\', "/");
+        // As the world server takes paths (Windows ones under Wine), with forward slashes.
+        let mangosd_exe = self.program("mangosd");
+        let slash = |p: PathBuf| mangosd_exe.path_arg(&p).replace('\\', "/");
         let db = |name: &str| format!("\"127.0.0.1;{DB_PORT};mangos;mangos;{name}\"");
         let mmap = if self.has_mmaps() { "1" } else { "0" };
         let mangosd: Vec<(&str, String)> = vec![
@@ -291,20 +306,26 @@ impl Server {
         if !listening(DB_PORT) {
             step("Starting the database...");
             let maria = self.maria();
-            Command::new(maria.join("bin").join("mariadbd.exe"))
-                .arg("--no-defaults")
-                .arg(format!("--basedir={}", maria.display()))
-                .arg(format!("--datadir={}", maria.join("data").display()))
+            let server = self.mariadbd();
+            let mut cmd = server.command();
+            cmd.arg("--no-defaults");
+            // A system-wide MariaDB (Linux) has its own files where it was installed.
+            if server.bundled {
+                cmd.arg(format!("--basedir={}", server.path_arg(&maria)));
+            }
+            cmd.arg(format!("--datadir={}", server.path_arg(&maria.join("data"))))
                 .arg(format!("--port={DB_PORT}"))
-                .arg("--bind-address=127.0.0.1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-                .map_err(|e| format!("couldn't start the database: {e}"))?;
+                .arg("--bind-address=127.0.0.1");
+            if !server.wine && cfg!(not(windows)) {
+                // Its socket in its own folder (the system's may not be ours to write), and table
+                // names as the database made on Windows has them.
+                cmd.arg(format!("--socket={}", maria.join("data").join("mariadb.sock").display()))
+                    .arg(format!("--pid-file={}", maria.join("data").join("mariadb.pid").display()))
+                    .arg("--lower-case-table-names=1");
+            }
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("couldn't start the database: {e}"))?;
             if !wait_for(DB_PORT, 40) {
-                return Err("The database didn't start (see mariadb\\data\\*.err).".into());
+                return Err(format!("The database didn't start (see {}).", Path::new("mariadb").join("data").join("*.err").display()));
             }
         }
         self.write_configs()?;
@@ -314,31 +335,31 @@ impl Server {
         }
         if !listening(REALM_PORT) {
             step("Starting the login server...");
-            Command::new(self.bin().join("realmd.exe"))
+            self.program("realmd")
+                .command()
                 .current_dir(self.bin())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map_err(|e| format!("couldn't start the login server: {e}"))?;
         }
         if !listening(WORLD_PORT) {
             step("Starting the world server (up to a minute)...");
-            Command::new(self.bin().join("mangosd.exe"))
+            self.program("mangosd")
+                .command()
                 .current_dir(self.bin())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map_err(|e| format!("couldn't start the world server: {e}"))?;
             if !wait_for(WORLD_PORT, 120) {
-                return Err("The world server didn't start (see server\\logs).".into());
+                return Err(format!("The world server didn't start (see {}).", Path::new("server").join("logs").display()));
             }
         }
         if !wait_for(REALM_PORT, 20) {
-            return Err("The login server didn't start (see server\\logs).".into());
+            return Err(format!("The login server didn't start (see {}).", Path::new("server").join("logs").display()));
         }
         Ok(())
     }
@@ -355,10 +376,11 @@ impl Server {
         };
         // The four bag slots (INVENTORY_SLOT_BAG_START 19 to 22).
         let sql = SQL.replace("BAGS", &(19..=22).map(slot).collect::<Vec<_>>().join("; "));
-        let ok = Command::new(self.mariadb_client())
+        let ok = self
+            .mariadb()
+            .command()
             .args(["-h", "127.0.0.1", "-P", &DB_PORT.to_string(), "-u", "root", "-e", &sql])
             .stdin(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -369,24 +391,15 @@ impl Server {
 
     /// The world server first (it saves characters on the way out), then the rest.
     pub fn stop(&self) {
-        let kill = |image: &str, force: bool| {
-            let mut args = vec!["/IM", image];
-            if force {
-                args.push("/F");
-            }
-            let _ = Command::new("taskkill").args(args).creation_flags(CREATE_NO_WINDOW).status();
-        };
-        kill("mangosd.exe", false);
+        let mangosd = self.program("mangosd").image();
+        platform::kill(&mangosd, false);
         let start = Instant::now();
         while listening(WORLD_PORT) && start.elapsed() < Duration::from_secs(15) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        kill("mangosd.exe", true);
-        kill("realmd.exe", true);
-        let _ = Command::new(self.maria().join("bin").join("mariadb-admin.exe"))
-            .args(["-h", "127.0.0.1", "-P", &DB_PORT.to_string(), "-u", "root", "shutdown"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        platform::kill(&mangosd, true);
+        platform::kill(&self.program("realmd").image(), true);
+        let _ = self.mariadb_admin().command().args(["-h", "127.0.0.1", "-P", &DB_PORT.to_string(), "-u", "root", "shutdown"]).status();
     }
 }
 
@@ -403,7 +416,7 @@ fn set_keys(path: &Path, keys: &[(&str, String)]) -> Result<(), String> {
             }
         })
         .collect();
-    std::fs::write(path, out.join("\r\n") + "\r\n").map_err(|e| format!("couldn't write {}: {e}", path.display()))
+    std::fs::write(path, out.join(platform::NEWLINE) + platform::NEWLINE).map_err(|e| format!("couldn't write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -416,7 +429,8 @@ mod tests {
         std::fs::write(&path, "# DataDir = \"old\"\nDataDir = \"C:/old\"\nOther = 1\nmmap.enabled = 1\n").unwrap();
         set_keys(&path, &[("DataDir", "\"D:/new\"".into()), ("mmap.enabled", "0".into())]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "# DataDir = \"old\"\r\nDataDir = \"D:/new\"\r\nOther = 1\r\nmmap.enabled = 0\r\n");
+        let want = ["# DataDir = \"old\"", "DataDir = \"D:/new\"", "Other = 1", "mmap.enabled = 0", ""];
+        assert_eq!(text, want.join(platform::NEWLINE));
         let _ = std::fs::remove_file(path);
     }
 }
@@ -432,4 +446,9 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A file in the server's data folder, as the player finds it (`server/data/<name>`).
+fn data_rel(name: &str) -> String {
+    Path::new("server").join("data").join(name).display().to_string()
 }
