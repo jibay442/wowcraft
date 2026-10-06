@@ -78,7 +78,10 @@ impl Paths {
                 _ => {}
             }
         }
-        if paths.prism.as_ref().is_none_or(|p| !p.exists()) {
+        // A folder given for Prism (typed in Settings) means the program in it: Windows answers
+        // "access denied" when asked to run a folder.
+        paths.prism = paths.prism.map(prism_exe);
+        if paths.prism.as_ref().is_none_or(|p| !p.is_file()) {
             paths.prism = find_prism().or_else(|| Some(paths.root.join("prism").join("prismlauncher.exe")).filter(|p| p.exists()));
         }
         paths
@@ -199,9 +202,8 @@ impl Paths {
     /// What's missing for the launcher to work, in words.
     fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let data = self.data_dir();
-        if !data.join("patch.MPQ").exists() && !data.join("dbc.MPQ").exists() {
-            out.push(format!("WoW 1.12 not found in {} (choose its folder in Settings)", self.wow_data.display()));
+        if let Some(problem) = self.wow_problem() {
+            out.push(problem);
         }
         if !self.benilla_exe().exists() {
             out.push(if self.packaged { "wow\\benilla.exe is missing: unzip the whole folder".into() } else { "benilla.exe not built".into() });
@@ -211,9 +213,38 @@ impl Paths {
         }
         out
     }
+
+    /// What's wrong with the chosen WoW folder, if anything: missing, or another version of WoW
+    /// (its files don't fit the 1.12 server: it stopped at start with "wrong client version DBC").
+    fn wow_problem(&self) -> Option<String> {
+        let data = self.data_dir();
+        let shown = self.wow_data.display();
+        // Today's WoW (Retail, Classic Era, Classic): CASC storage, no MPQ archives.
+        let casc = [self.wow_data.join(".build.info"), self.wow_data.join("..").join(".build.info"), data.join("data")]
+            .iter()
+            .any(|p| p.exists());
+        if casc && !data.join("dbc.MPQ").exists() {
+            return Some(format!(
+                "{shown} is today's WoW (Retail or Classic). WowCraft needs the original 1.12.1 client from 2006 (choose its folder in Settings)"
+            ));
+        }
+        // The Burning Crusade and Wrath of the Lich King: MPQs, but their own.
+        if ["common.MPQ", "expansion.MPQ", "lichking.MPQ", "common-2.MPQ"].iter().any(|f| data.join(f).exists()) {
+            return Some(format!("{shown} is a later WoW (The Burning Crusade or Wrath). WowCraft needs the 1.12.1 client (choose its folder in Settings)"));
+        }
+        if !data.join("dbc.MPQ").exists() {
+            return Some(format!("WoW 1.12 not found in {shown} (choose the folder with WoW.exe and Data in Settings)"));
+        }
+        None
+    }
 }
 
 /// Prism Launcher in the places its installers put it.
+/// Prism's program from what was chosen: a folder means the prismlauncher.exe in it.
+fn prism_exe(chosen: PathBuf) -> PathBuf {
+    if chosen.is_dir() { chosen.join("prismlauncher.exe") } else { chosen }
+}
+
 fn find_prism() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     [
@@ -592,6 +623,38 @@ fn start_dev_server(p: &Paths, shared: &Arc<Mutex<Shared>>) -> Result<(), String
     Ok(())
 }
 
+/// Prism starts Minecraft with the player's own account (it asks them to sign in if needed). If
+/// the chosen Prism won't start (an antivirus blocking it, say), the bundled one does, with its
+/// own copy of the instance.
+fn start_prism(p: &Paths) -> Result<(), String> {
+    let prism = p.prism.as_ref().ok_or("Prism Launcher not found")?;
+    let start = |exe: &Path| Command::new(exe).args(["--launch", INSTANCE]).spawn();
+    let bundled = p.root.join("prism").join("prismlauncher.exe");
+    let started = start(prism).or_else(|e| {
+        // Another Prism that won't start: the bundled one instead.
+        if bundled.is_file() && bundled != *prism {
+            // Its own copy of the instance first: the other Prism's folder had it.
+            let mut own = p.clone();
+            own.prism = Some(bundled.clone());
+            own.install_instance().map_err(|err| std::io::Error::other(err))?;
+            start(&bundled)
+        } else {
+            Err(e)
+        }
+    });
+    if let Err(e) = started {
+        return Err(if e.raw_os_error() == Some(5) {
+            format!(
+                "Windows refused to start Prism Launcher ({}). Your antivirus may be blocking it: allow that file, or right-click it, Properties, Unblock. Then press PLAY again.",
+                prism.display()
+            )
+        } else {
+            format!("couldn't start Prism Launcher: {e}")
+        });
+    }
+    Ok(())
+}
+
 /// What Minecraft reads at start, in config/skycraft.properties: whose world, and (packaged) the
 /// co-op and account settings the environment can't carry through Prism.
 fn minecraft_settings(p: &Paths, mode: Mode, link: &str) {
@@ -679,12 +742,7 @@ fn launch(p: &Paths, mode: Mode, link: &str, shared: &Arc<Mutex<Shared>>) -> Res
         p.install_instance()?;
         minecraft_settings(p, mode, link);
         let before = java_pids();
-        let prism = p.prism.as_ref().ok_or("Prism Launcher not found")?;
-        // Prism starts it with the player's own account (it asks them to sign in if needed).
-        Command::new(prism)
-            .args(["--launch", INSTANCE])
-            .spawn()
-            .map_err(|e| format!("couldn't start Prism Launcher: {e}"))?;
+        start_prism(p)?;
         say("Starting Minecraft in Prism. The first time, sign in there; it then downloads Minecraft (a few minutes).");
         let asked = Instant::now();
         while !java_pids().iter().any(|pid| !before.contains(pid)) {
@@ -1204,6 +1262,100 @@ mod tests {
     }
 
     /// The WoW folder or its Data folder both work.
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wowcraft-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn paths_at(root: &Path, wow: &Path) -> Paths {
+        Paths { root: root.to_path_buf(), packaged: true, wow_data: wow.to_path_buf(), skin: String::new(), name: String::new(), prism: None }
+    }
+
+    /// Only the 1.12 client passes; TBC/Wrath, today's WoW and a wrong folder each say what they are.
+    #[test]
+    fn the_wow_folder_must_be_the_1_12_client() {
+        let root = tmp("wowcheck");
+        let check = |files: &[&str]| {
+            let wow = root.join(format!("wow{}", files.len() * 7 + files.first().map_or(0, |f| f.len())));
+            std::fs::create_dir_all(wow.join("Data")).unwrap();
+            for f in files {
+                let path = wow.join(f);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "").unwrap();
+            }
+            paths_at(&root, &wow).wow_problem()
+        };
+        assert_eq!(check(&["Data/dbc.MPQ", "Data/patch.MPQ"]), None, "1.12 passes");
+        assert!(check(&["Data/patch.MPQ", "Data/common.MPQ", "Data/expansion.MPQ"]).unwrap().contains("later WoW"), "TBC");
+        assert!(check(&["Data/patch.MPQ", "Data/lichking.MPQ"]).unwrap().contains("later WoW"), "Wrath");
+        assert!(check(&[".build.info", "Data/data/0000000001.idx"]).unwrap().contains("today's WoW"), "Classic/Retail");
+        assert!(check(&["readme.txt"]).unwrap().contains("not found"), "wrong folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder chosen for Prism means its program (Windows "access denied" for running a folder).
+    #[test]
+    fn a_prism_folder_means_its_program() {
+        let dir = tmp("prismdir");
+        assert_eq!(prism_exe(dir.clone()), dir.join("prismlauncher.exe"));
+        let exe = dir.join("prismlauncher.exe");
+        std::fs::write(&exe, "").unwrap();
+        assert_eq!(prism_exe(exe.clone()), exe);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in Prism: Windows' where.exe, which starts and quits at once.
+    fn fake_prism(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("portable.txt"), "").unwrap();
+        let exe = dir.join("prismlauncher.exe");
+        std::fs::copy(Path::new(&std::env::var("SystemRoot").unwrap()).join("System32").join("where.exe"), &exe).unwrap();
+        exe
+    }
+
+    /// Windows refuses to run it: the same "Access is denied. (os error 5)" as the report.
+    fn deny_running(exe: &Path) {
+        let ok = Command::new("icacls").arg(exe).args(["/deny", "*S-1-1-0:(RX)"]).stdout(Stdio::null()).status().unwrap().success();
+        assert!(ok, "icacls deny");
+    }
+
+    fn allow_running(exe: &Path) {
+        let _ = Command::new("icacls").arg(exe).args(["/remove:d", "*S-1-1-0"]).stdout(Stdio::null()).status();
+    }
+
+    /// An installed Prism that Windows won't start: the bundled one starts instead, with the
+    /// instance copied into it; with no bundled one, the message says what to do.
+    #[test]
+    fn a_blocked_prism_falls_back_to_the_bundled_one() {
+        let root = tmp("prismstart");
+        let src = root.join("minecraft").join(INSTANCE);
+        std::fs::create_dir_all(src.join("minecraft").join("mods")).unwrap();
+        std::fs::write(src.join("instance.cfg"), "name=WowCraft").unwrap();
+        std::fs::write(src.join("mmc-pack.json"), "{}").unwrap();
+        std::fs::write(src.join("minecraft").join("mods").join("wowcraft-1.jar"), "jar").unwrap();
+        let bundled = fake_prism(&root.join("prism"));
+        let other = fake_prism(&root.join("other-prism"));
+        let mut p = paths_at(&root, &root);
+        p.prism = Some(other.clone());
+        // The report first: starting the blocked one really is "access denied".
+        deny_running(&other);
+        let raw = Command::new(&other).spawn().map(|mut c| { let _ = c.wait(); }).unwrap_err();
+        assert_eq!(raw.raw_os_error(), Some(5), "reproduced: {raw}");
+        start_prism(&p).expect("the bundled Prism starts");
+        assert!(root.join("prism").join("instances").join(INSTANCE).join("instance.cfg").is_file(), "instance copied to the bundled Prism");
+        // No bundled one to fall back to: a message that says what to do.
+        // The stand-in may still be running for a moment.
+        let gone = (0..50).any(|_| std::fs::remove_file(&bundled).is_ok() || { std::thread::sleep(Duration::from_millis(100)); false });
+        assert!(gone, "bundled stand-in removed");
+        let err = start_prism(&p).unwrap_err();
+        assert!(err.contains("Windows refused") && err.contains("antivirus"), "{err}");
+        allow_running(&other);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_wow_folder_finds_its_data() {
         let tmp = std::env::temp_dir().join(format!("wowcraft-launcher-data-{}", std::process::id()));
